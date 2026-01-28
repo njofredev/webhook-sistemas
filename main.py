@@ -1,20 +1,20 @@
 import os
 import json
 import psycopg2
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from psycopg2.extras import RealDictCursor
 
-app = FastAPI(title="Webhook Receiver - Policlínico Tabancura")
+app = FastAPI(title="Receptor Pro - Policlínico Tabancura")
 
-# 1. Configuración de la Base de Datos
-# Asegúrate de que esta variable esté en las 'Environment Variables' de Coolify
+# URL de conexión a tu base de datos db_webhook
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def init_db():
-    """Crea la tabla si no existe al iniciar la aplicación."""
+    """Asegura que la tabla tenga todas las columnas necesarias."""
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
+        # Creamos la tabla base si no existe
         cur.execute("""
             CREATE TABLE IF NOT EXISTS webhooks_dentalink (
                 id SERIAL PRIMARY KEY,
@@ -24,61 +24,90 @@ def init_db():
                 datos_json JSONB
             );
         """)
+        # Añadimos las columnas específicas para los elementos del JSON
+        # Usamos 'IF NOT EXISTS' para no dar error si ya las creaste
+        columnas = [
+            "id_cita INTEGER",
+            "fecha_cita DATE",
+            "hora_inicio TIME",
+            "id_estado INTEGER",
+            "estado_cita TEXT",
+            "comentarios TEXT",
+            "id_sillon INTEGER"
+        ]
+        for col in columnas:
+            try:
+                cur.execute(f"ALTER TABLE webhooks_dentalink ADD COLUMN {col};")
+            except psycopg2.errors.DuplicateColumn:
+                conn.rollback() # Ignorar si la columna ya existe
+            else:
+                conn.commit()
+        
         conn.commit()
         cur.close()
         conn.close()
-        print("Base de datos inicializada correctamente.")
+        print("Estructura de base de datos verificada.")
     except Exception as e:
-        print(f"Error inicializando la base de datos: {e}")
+        print(f"Error al inicializar DB: {e}")
 
-# Inicializar al cargar el script
+# Ejecutar inicialización al arrancar
 init_db()
-
-@app.get("/")
-async def root():
-    return {"message": "Webhook Listener activo para Policlínico Tabancura"}
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     try:
-        # 2. Recibir y procesar el JSON
         payload = await request.json()
         
-        # Extraer datos según la estructura de Dentalink/Medilink
-        # Ajustamos los nombres de las llaves según tus pruebas previas
-        evento = payload.get("nombre_evento") or payload.get("evento") or "desconocido"
+        # Dentalink/Medilink envían la info dentro de 'data'
+        d = payload.get("data", {})
         
-        # Intentar extraer el nombre del paciente si viene en un objeto anidado
-        paciente_info = payload.get("paciente", {})
-        if isinstance(paciente_info, dict):
-            nombre_paciente = paciente_info.get("nombre", "Sin nombre")
-        else:
-            nombre_paciente = str(paciente_info)
+        # 1. Extraemos cada elemento del JSON
+        id_cita = d.get("id")
+        fecha = d.get("fecha")
+        hora = d.get("hora_inicio")
+        id_estado = d.get("id_estado")
+        estado_txt = d.get("estado_cita")
+        comentarios = d.get("comentarios")
+        id_sillon = d.get("id_sillon")
+        
+        # Intentar buscar nombre del paciente (ajustar según el JSON real si aparece)
+        nombre_paciente = d.get("paciente", "Paciente Dentalink")
+        
+        # Definimos el tipo de evento principal
+        evento_principal = estado_txt if estado_txt else f"Estado {id_estado}"
 
-        # 3. Convertir a string JSON válido para PostgreSQL (JSONB)
-        # Esto evita el error 'invalid input syntax for type json'
-        json_string = json.dumps(payload)
-
-        # 4. Insertar en la base de datos
+        # 2. Insertar en columnas individuales
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
+        
         query = """
-            INSERT INTO webhooks_dentalink (evento_tipo, paciente_nombre, datos_json)
-            VALUES (%s, %s, %s)
+            INSERT INTO webhooks_dentalink 
+            (evento_tipo, paciente_nombre, datos_json, id_cita, fecha_cita, hora_inicio, id_estado, estado_cita, comentarios, id_sillon)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
-        cur.execute(query, (evento, nombre_paciente, json_string))
+        
+        cur.execute(query, (
+            evento_principal,
+            nombre_paciente,
+            json.dumps(payload), # Guardamos el JSON completo por respaldo
+            id_cita,
+            fecha if fecha else None,
+            hora if hora else None,
+            id_estado,
+            estado_txt,
+            comentarios,
+            id_sillon
+        ))
         
         conn.commit()
         cur.close()
         conn.close()
-
-        return {"status": "success", "message": "Evento registrado"}
+        
+        return {"status": "success", "detail": "Registro procesado por columnas"}
 
     except Exception as e:
-        # Si algo falla, devolvemos el error para debugear en el cURL
         return {"status": "error", "message": str(e)}
 
-if __name__ == "__main__":
-    import uvicorn
-    # Puerto 8000 para que coincida con la configuración de Coolify
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/health")
+async def health_check():
+    return {"status": "online", "database": "connected"}
